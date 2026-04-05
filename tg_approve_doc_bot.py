@@ -6,7 +6,7 @@ from aiogram.filters import Command
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 
 TOKEN = "8357878054:AAH90lsvErdtDacheicT0pRPP0Sf_lw1wEg"
-OWNER_ID = 6669987713
+OWNER_ID = 29571769
 
 bot = Bot(token=TOKEN)
 dp = Dispatcher()
