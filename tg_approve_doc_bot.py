@@ -1,21 +1,20 @@
 import asyncio
 import uuid
-import aiogram
 from aiogram import Bot, Dispatcher, F, types
 from aiogram.filters import Command
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 
-TOKEN = "8357878054:AAH90lsvErdtDacheicT0pRPP0Sf_lw1wEg"          # ← замени
-OWNER_ID = 6669987713                    # ← ТВОЙ Telegram ID (узнать можно через @userinfobot)
+TOKEN = "8357878054:AAH90lsvErdtDacheicT0pRPP0Sf_lw1wEg"
+OWNER_ID = 6669987713
 
 bot = Bot(token=TOKEN)
 dp = Dispatcher()
 
-# Хранилище заявок (для продакшена замени на SQLite/Redis)
+# Хранилище заявок (пока в памяти)
 pending_approvals = {}      # approval_id → данные
 waiting_for_comment = {}    # reviewer_id → approval_id
 
-# ====================== КЛАВИАТУРА ======================
+
 def get_approval_keyboard(approval_id: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="✅ Одобрить", callback_data=f"approve:{approval_id}")],
@@ -24,16 +23,34 @@ def get_approval_keyboard(approval_id: str) -> InlineKeyboardMarkup:
     ])
 
 
+def get_new_document_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📄 Отправить новый документ", callback_data="new_document")]
+    ])
+
+
 # ====================== СТАРТ ======================
 @dp.message(Command("start"))
 async def cmd_start(message: types.Message):
     if message.from_user.id == OWNER_ID:
         await message.answer(
-            "👋 Я бот для одобрения документов.\n\n"
-            "Просто отправь мне любой документ — я спрошу, кому его отправить на рецензию."
+            "👋 Добро пожаловать!\n\n"
+            "Отправьте мне любой документ, и я помогу отправить его на одобрение.",
+            reply_markup=get_new_document_keyboard()
         )
     else:
-        await message.answer("✅ Вы зарегистрированы как рецензент. Ожидайте документы на одобрение.")
+        await message.answer("✅ Вы зарегистрированы как рецензент.\nОжидайте документы на одобрение.")
+
+
+# ====================== КНОПКА "Отправить новый документ" ======================
+@dp.callback_query(F.data == "new_document")
+async def new_document_callback(callback: types.CallbackQuery):
+    if callback.from_user.id != OWNER_ID:
+        await callback.answer("Эта функция доступна только владельцу", show_alert=True)
+        return
+    
+    await callback.answer()
+    await callback.message.answer("📄 Отправьте документ, который нужно одобрить.")
 
 
 # ====================== ВЛАДЕЛЕЦ ОТПРАВЛЯЕТ ДОКУМЕНТ ======================
@@ -50,7 +67,11 @@ async def owner_sent_document(message: types.Message):
         "review_message_id": None,
     }
 
-    await message.answer("📄 Документ получен.\n\nВведите chat_id рецензента (или попросите его написать мне /start и скиньте мне его ID):")
+    await message.answer(
+        "📄 Документ получен.\n\n"
+        "Введите chat_id рецензента:",
+        reply_markup=get_new_document_keyboard()
+    )
 
 
 # ====================== ВЛАДЕЛЕЦ ВВОДИТ CHAT_ID РЕЦЕНЗЕНТА ======================
@@ -59,33 +80,38 @@ async def owner_enter_reviewer_id(message: types.Message):
     try:
         reviewer_id = int(message.text)
     except ValueError:
-        await message.answer("❌ Неверный chat_id. Должен быть только цифры.")
+        await message.answer("❌ Неверный chat_id. Введите только цифры.")
         return
 
-    # Находим последнюю созданную заявку (самую свежую)
     if not pending_approvals:
         await message.answer("❌ Нет активных заявок.")
         return
 
+    # Берём самую свежую заявку
     approval_id = list(pending_approvals.keys())[-1]
     approval = pending_approvals[approval_id]
     approval["reviewer_id"] = reviewer_id
 
-    # Отправляем документ рецензенту
     keyboard = get_approval_keyboard(approval_id)
 
-    sent_msg = await bot.send_document(
-        chat_id=reviewer_id,
-        document=approval["document_file_id"],
-        caption="📄 Документ на одобрение\n\nВыберите действие ниже 👇",
-        reply_markup=keyboard
-    )
+    try:
+        sent_msg = await bot.send_document(
+            chat_id=reviewer_id,
+            document=approval["document_file_id"],
+            caption="📄 Документ на одобрение\n\nВыберите действие ниже 👇",
+            reply_markup=keyboard
+        )
 
-    # Сохраняем, чтобы потом можно было отредактировать сообщение
-    approval["review_chat_id"] = reviewer_id
-    approval["review_message_id"] = sent_msg.message_id
+        approval["review_chat_id"] = reviewer_id
+        approval["review_message_id"] = sent_msg.message_id
 
-    await message.answer(f"✅ Документ отправлен рецензенту (chat_id: {reviewer_id})")
+        await message.answer(
+            f"✅ Документ успешно отправлен рецензенту!\n"
+            f"Chat ID: {reviewer_id}",
+            reply_markup=get_new_document_keyboard()
+        )
+    except Exception as e:
+        await message.answer(f"❌ Не удалось отправить документ.\nОшибка: {e}")
 
 
 # ====================== ОБРАБОТКА КНОПОК ======================
@@ -100,41 +126,43 @@ async def process_callback(callback: types.CallbackQuery):
     approval = pending_approvals[approval_id]
     reviewer = callback.from_user
 
-    # Проверка, что кнопки жмёт именно тот, кому отправили
-    if reviewer.id != approval["reviewer_id"]:
+    if reviewer.id != approval.get("reviewer_id"):
         await callback.answer("Это не ваша заявка", show_alert=True)
         return
+
+    # Мгновенный ответ Telegram (самое важное для скорости кнопок!)
+    await callback.answer()
 
     if action == "approve":
         await bot.send_message(
             OWNER_ID,
             f"✅ <b>Одобрено</b>\n"
-            f"Рецензент: @{reviewer.username or reviewer.id}\n"
-            f"Документ обработан.",
+            f"Рецензент: @{reviewer.username or reviewer.id}",
             parse_mode="HTML"
         )
-        await callback.message.edit_text("✅ <b>Одобрено</b>", parse_mode="HTML")
+        await callback.message.edit_text("✅ <b>Документ одобрен</b>", parse_mode="HTML")
 
     elif action == "reject":
         await bot.send_message(
             OWNER_ID,
             f"❌ <b>Отклонено</b>\n"
-            f"Рецензент: @{reviewer.username or reviewer.id}\n"
-            f"Документ обработан.",
+            f"Рецензент: @{reviewer.username or reviewer.id}",
             parse_mode="HTML"
         )
-        await callback.message.edit_text("❌ <b>Отклонено</b>", parse_mode="HTML")
+        await callback.message.edit_text("❌ <b>Документ отклонён</b>", parse_mode="HTML")
 
     elif action == "comment":
-        await callback.answer("Напишите комментарий в следующем сообщении")
+        await callback.answer("Напишите ваш комментарий в следующем сообщении", show_alert=False)
         waiting_for_comment[reviewer.id] = approval_id
-        # Убираем кнопки, чтобы не нажимали повторно
+        # Убираем кнопки
         await callback.message.edit_reply_markup(reply_markup=None)
+        return
 
-    await callback.answer()
+    # Удаляем заявку после одобрения/отклонения
+    pending_approvals.pop(approval_id, None)
 
 
-# ====================== РЕЦЕНЗЕНТ ПИШЕТ КОММЕНТАРИЙ ======================
+# ====================== ОБРАБОТКА КОММЕНТАРИЯ ======================
 @dp.message(lambda m: m.from_user.id in waiting_for_comment)
 async def handle_comment(message: types.Message):
     reviewer_id = message.from_user.id
@@ -153,19 +181,18 @@ async def handle_comment(message: types.Message):
         parse_mode="HTML"
     )
 
-    # Можно отредактировать исходное сообщение рецензента
+    # Обновляем сообщение рецензенту
     try:
         await bot.edit_message_text(
             chat_id=approval["review_chat_id"],
             message_id=approval["review_message_id"],
-            text=f"📄 Документ на одобрение\n\n💬 Комментарий отправлен:\n{message.text[:500]}..."
+            text=f"📄 Документ на одобрение\n\n💬 Комментарий отправлен:\n{message.text[:400]}..."
         )
     except:
         pass
 
-    await message.answer("✅ Комментарий успешно отправлен владельцу.")
+    await message.answer("✅ Ваш комментарий успешно отправлен владельцу.")
 
-    # Удаляем заявку из активных
     pending_approvals.pop(approval_id, None)
 
 
@@ -174,10 +201,6 @@ async def main():
     print("🚀 Бот запущен...")
     await dp.start_polling(bot)
 
-
-async def main():
-    print("🚀 Бот запущен...")
-    await dp.start_polling(bot)
 
 if __name__ == "__main__":
     asyncio.run(main())
