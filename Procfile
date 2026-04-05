@@ -1,0 +1,1 @@
+worker: python tg_approve_doc_bot.py
