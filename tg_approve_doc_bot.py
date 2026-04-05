@@ -13,6 +13,10 @@ dp = Dispatcher()
 
 DB_NAME = "reviewers.db"
 
+# ✅ Объявляем глобальные словари
+pending_approvals = {}
+waiting_for_comment = {}
+
 # ====================== РАБОТА С БАЗОЙ ======================
 async def init_db():
     async with aiosqlite.connect(DB_NAME) as db:
@@ -99,11 +103,9 @@ async def select_reviewer(callback: types.CallbackQuery):
 
     reviewer_id = int(callback.data.split(":")[1])
 
-    # Сохраняем выбранного рецензента во временное хранилище (для следующего документа)
     if not hasattr(dp, "pending_document"):
         dp.pending_document = {}
 
-    # Ждём, когда владелец отправит документ после выбора
     dp.pending_document[OWNER_ID] = reviewer_id
 
     await callback.answer()
@@ -124,9 +126,13 @@ async def owner_sent_document(message: types.Message):
     file_id = message.document.file_id
     approval_id = str(uuid.uuid4())
 
-    # Здесь можно добавить pending_approvals как раньше, если нужно
+    # ✅ Сохраняем заявку — это было пропущено!
+    pending_approvals[approval_id] = {
+        "reviewer_id": reviewer_id,
+        "file_id": file_id,
+    }
 
-    keyboard = InlineKeyboardMarkup(inline_keyboard=[  # упрощённая клавиатура для примера
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="✅ Одобрить", callback_data=f"approve:{approval_id}")],
         [InlineKeyboardButton(text="❌ Отклонить", callback_data=f"reject:{approval_id}")],
         [InlineKeyboardButton(text="💬 Комментарий", callback_data=f"comment:{approval_id}")]
@@ -142,6 +148,8 @@ async def owner_sent_document(message: types.Message):
         await message.answer(f"✅ Документ успешно отправлен рецензенту (ID: {reviewer_id})")
     except Exception as e:
         await message.answer(f"❌ Не удалось отправить: {e}")
+        pending_approvals.pop(approval_id, None)  # Чистим если не отправилось
+
 
 # ====================== ОБРАБОТКА КНОПОК ======================
 @dp.callback_query(F.data.startswith(("approve:", "reject:", "comment:")))
@@ -159,64 +167,68 @@ async def process_callback(callback: types.CallbackQuery):
         await callback.answer("Это не ваша заявка", show_alert=True)
         return
 
-    # Мгновенный ответ Telegram
     await callback.answer()
 
     if action == "approve":
         owner_text = f"✅ <b>Одобрено</b>\nРецензент: @{reviewer.username or reviewer.id}"
-        reviewer_text = "✅ Документ успешно одобрен!"
-
         await bot.send_message(OWNER_ID, owner_text, parse_mode="HTML")
-        await bot.send_message(
-            reviewer.id, 
-            reviewer_text, 
-            reply_to_message_id=callback.message.message_id
-        )
+        await callback.message.answer("✅ Документ успешно одобрен!")
 
     elif action == "reject":
         owner_text = f"❌ <b>Отклонено</b>\nРецензент: @{reviewer.username or reviewer.id}"
-        reviewer_text = "❌ Документ успешно отклонён!"
-
         await bot.send_message(OWNER_ID, owner_text, parse_mode="HTML")
-        await bot.send_message(
-            reviewer.id, 
-            reviewer_text, 
-            reply_to_message_id=callback.message.message_id
-        )
+        await callback.message.answer("❌ Документ успешно отклонён!")
 
     elif action == "comment":
-        await callback.answer("Напишите комментарий ниже", show_alert=False)
-        
-        await bot.send_message(
-            reviewer.id,
-            "💬 Пожалуйста, напишите ваш комментарий к документу ниже:",
-            reply_to_message_id=callback.message.message_id
-        )
-        
         waiting_for_comment[reviewer.id] = approval_id
-        # Убираем клавиатуру
+        await callback.message.answer("💬 Пожалуйста, напишите ваш комментарий к документу ниже:")
         try:
             await callback.message.edit_reply_markup(reply_markup=None)
         except:
             pass
-        return
+        return  # Не завершаем заявку — ждём комментарий
 
-    # После одобрения или отклонения — убираем клавиатуру
+    # Убираем клавиатуру и завершаем заявку
     try:
         await callback.message.edit_reply_markup(reply_markup=None)
     except:
         pass
 
-    # Завершаем заявку
     pending_approvals.pop(approval_id, None)
 
-    # Показываем владельцу кнопку нового документа
     await bot.send_message(
         OWNER_ID,
         "✅ Работа с документом завершена.\nМожете отправить следующий документ.",
         reply_markup=get_new_document_keyboard()
     )
-    
+
+
+# ====================== ОБРАБОТКА КОММЕНТАРИЯ ======================
+@dp.message(F.text, lambda m: m.from_user.id in waiting_for_comment)
+async def handle_comment(message: types.Message):
+    reviewer = message.from_user
+    approval_id = waiting_for_comment.pop(reviewer.id, None)
+
+    if not approval_id:
+        return
+
+    comment_text = (
+        f"💬 <b>Комментарий рецензента</b>\n"
+        f"От: @{reviewer.username or reviewer.id}\n\n"
+        f"{message.text}"
+    )
+    await bot.send_message(OWNER_ID, comment_text, parse_mode="HTML")
+    await message.answer("✅ Комментарий отправлен владельцу.")
+
+    pending_approvals.pop(approval_id, None)
+
+    await bot.send_message(
+        OWNER_ID,
+        "✅ Работа с документом завершена.\nМожете отправить следующий документ.",
+        reply_markup=get_new_document_keyboard()
+    )
+
+
 # ====================== ЗАПУСК ======================
 async def main():
     await init_db()
