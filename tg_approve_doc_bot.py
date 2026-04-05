@@ -10,8 +10,8 @@ OWNER_ID = 6669987713
 bot = Bot(token=TOKEN)
 dp = Dispatcher()
 
-pending_approvals = {}      # approval_id → данные
-waiting_for_comment = {}    # reviewer_id → approval_id
+pending_approvals = {}
+waiting_for_comment = {}
 
 
 def get_approval_keyboard(approval_id: str) -> InlineKeyboardMarkup:
@@ -33,54 +33,43 @@ def get_new_document_keyboard() -> InlineKeyboardMarkup:
 async def cmd_start(message: types.Message):
     if message.from_user.id == OWNER_ID:
         await message.answer(
-            "👋 Добро пожаловать в бот одобрения документов!\n\n"
-            "Нажмите кнопку ниже, чтобы отправить новый документ.",
+            "👋 Добро пожаловать!\n\nНажмите кнопку ниже, чтобы отправить документ на одобрение.",
             reply_markup=get_new_document_keyboard()
         )
     else:
-        await message.answer("✅ Вы зарегистрированы как рецензент.\nОжидайте документы на одобрение.")
+        await message.answer("✅ Вы рецензент. Ожидайте документы.")
 
 
-# ====================== КНОПКА "Отправить новый документ" ======================
+# ====================== НОВЫЙ ДОКУМЕНТ ======================
 @dp.callback_query(F.data == "new_document")
 async def new_document_callback(callback: types.CallbackQuery):
     if callback.from_user.id != OWNER_ID:
-        await callback.answer("Эта функция доступна только владельцу", show_alert=True)
+        await callback.answer("Доступно только владельцу", show_alert=True)
         return
-
     await callback.answer()
-    await callback.message.answer("📄 Отправьте документ, который нужно отправить на одобрение.")
+    await callback.message.answer("📄 Отправьте документ для одобрения.")
 
 
-# ====================== ВЛАДЕЛЕЦ ОТПРАВЛЯЕТ ДОКУМЕНТ ======================
+# ====================== ОТПРАВКА ДОКУМЕНТА ======================
 @dp.message(F.document, lambda m: m.from_user.id == OWNER_ID)
 async def owner_sent_document(message: types.Message):
     file_id = message.document.file_id
     approval_id = str(uuid.uuid4())
 
     pending_approvals[approval_id] = {
-        "sender_id": OWNER_ID,
         "reviewer_id": None,
         "document_file_id": file_id,
         "review_chat_id": None,
         "review_message_id": None,
-        "status": "pending"   # новый статус
     }
 
-    await message.answer(
-        "📄 Документ получен.\n\nВведите chat_id рецензента:",
-        reply_markup=None  # кнопка "новый документ" не показывается пока
-    )
+    await message.answer("📄 Документ получен.\n\nВведите chat_id рецензента:")
 
 
-# ====================== ВЛАДЕЛЕЦ ВВОДИТ CHAT_ID ======================
+# ====================== ВВОД CHAT_ID ======================
 @dp.message(lambda m: m.from_user.id == OWNER_ID and m.text and m.text.isdigit())
 async def owner_enter_reviewer_id(message: types.Message):
-    try:
-        reviewer_id = int(message.text)
-    except ValueError:
-        await message.answer("❌ Неверный chat_id. Введите только цифры.")
-        return
+    reviewer_id = int(message.text)
 
     if not pending_approvals:
         await message.answer("❌ Нет активных заявок.")
@@ -92,20 +81,17 @@ async def owner_enter_reviewer_id(message: types.Message):
 
     keyboard = get_approval_keyboard(approval_id)
 
-    try:
-        sent_msg = await bot.send_document(
-            chat_id=reviewer_id,
-            document=approval["document_file_id"],
-            caption="📄 Документ на одобрение\n\nВыберите действие ниже 👇",
-            reply_markup=keyboard
-        )
+    sent_msg = await bot.send_document(
+        chat_id=reviewer_id,
+        document=approval["document_file_id"],
+        caption="📄 Документ на одобрение\n\nВыберите действие ниже 👇",
+        reply_markup=keyboard
+    )
 
-        approval["review_chat_id"] = reviewer_id
-        approval["review_message_id"] = sent_msg.message_id
+    approval["review_chat_id"] = reviewer_id
+    approval["review_message_id"] = sent_msg.message_id
 
-        await message.answer(f"✅ Документ отправлен рецензенту (ID: {reviewer_id})")
-    except Exception as e:
-        await message.answer(f"❌ Ошибка отправки: {e}")
+    await message.answer(f"✅ Документ отправлен рецензенту (ID: {reviewer_id})")
 
 
 # ====================== ОБРАБОТКА КНОПОК ======================
@@ -124,61 +110,49 @@ async def process_callback(callback: types.CallbackQuery):
         await callback.answer("Это не ваша заявка", show_alert=True)
         return
 
-    # Мгновенный ответ
-    await callback.answer()
+    await callback.answer()   # мгновенный ответ
 
     if action == "approve":
-        await bot.send_message(
-            OWNER_ID,
-            f"✅ <b>Одобрено</b>\nРецензент: @{reviewer.username or reviewer.id}",
-            parse_mode="HTML"
-        )
-        await callback.message.edit_text("✅ <b>Документ одобрен</b>", parse_mode="HTML")
-        
-        # Уведомление рецензенту
-        await bot.send_message(
-            reviewer.id,
-            "✅ Документ успешно одобрен!",
-            reply_to_message_id=callback.message.message_id
-        )
+        owner_text = f"✅ <b>Одобрено</b>\nРецензент: @{reviewer.username or reviewer.id}"
+        reviewer_text = "✅ Документ успешно одобрен!"
 
     elif action == "reject":
-        await bot.send_message(
-            OWNER_ID,
-            f"❌ <b>Отклонено</b>\nРецензент: @{reviewer.username or reviewer.id}",
-            parse_mode="HTML"
-        )
-        await callback.message.edit_text("❌ <b>Документ отклонён</b>", parse_mode="HTML")
-        
-        # Уведомление рецензенту
-        await bot.send_message(
-            reviewer.id,
-            "❌ Документ успешно отклонён!",
-            reply_to_message_id=callback.message.message_id
-        )
+        owner_text = f"❌ <b>Отклонено</b>\nРецензент: @{reviewer.username or reviewer.id}"
+        reviewer_text = "❌ Документ успешно отклонён!"
 
-    elif action == "comment":
-        await callback.answer("Напишите ваш комментарий в следующем сообщении")
+    else:  # comment
+        await callback.answer("Напишите комментарий в следующем сообщении")
         waiting_for_comment[reviewer.id] = approval_id
         await callback.message.edit_reply_markup(reply_markup=None)
         return
 
-    # После одобрения или отклонения — помечаем как завершённый и показываем кнопку владельцу
-    approval["status"] = "completed"
-    pending_approvals.pop(approval_id, None)
+    # Отправляем результат владельцу
+    await bot.send_message(OWNER_ID, owner_text, parse_mode="HTML")
 
-    # Показываем владельцу кнопку "Отправить новый документ"
+    # Уведомление рецензенту
+    await bot.send_message(
+        chat_id=reviewer.id,
+        text=reviewer_text,
+        reply_to_message_id=callback.message.message_id
+    )
+
+    # Удаляем клавиатуру с исходного сообщения
     try:
-        await bot.send_message(
-            OWNER_ID,
-            "✅ Работа с документом завершена.\nМожете отправить следующий документ.",
-            reply_markup=get_new_document_keyboard()
-        )
+        await callback.message.edit_reply_markup(reply_markup=None)
     except:
         pass
 
+    # Завершаем заявку и показываем кнопку владельцу
+    pending_approvals.pop(approval_id, None)
 
-# ====================== ОБРАБОТКА КОММЕНТАРИЯ ======================
+    await bot.send_message(
+        OWNER_ID,
+        "✅ Работа с документом завершена.\nМожете отправить следующий документ.",
+        reply_markup=get_new_document_keyboard()
+    )
+
+
+# ====================== КОММЕНТАРИЙ ======================
 @dp.message(lambda m: m.from_user.id in waiting_for_comment)
 async def handle_comment(message: types.Message):
     reviewer_id = message.from_user.id
@@ -192,29 +166,17 @@ async def handle_comment(message: types.Message):
     await bot.send_message(
         OWNER_ID,
         f"💬 <b>Комментарий от рецензента</b>\n"
-        f"@{message.from_user.username or reviewer_id}\n\n"
-        f"{message.text}",
+        f"@{message.from_user.username or reviewer_id}\n\n{message.text}",
         parse_mode="HTML"
     )
 
-    try:
-        await bot.edit_message_text(
-            chat_id=approval["review_chat_id"],
-            message_id=approval["review_message_id"],
-            text=f"📄 Документ на одобрение\n\n💬 Комментарий отправлен:\n{message.text[:400]}..."
-        )
-    except:
-        pass
+    await message.answer("✅ Комментарий отправлен владельцу.")
 
-    await message.answer("✅ Комментарий успешно отправлен владельцу.")
-
-    # После комментария тоже считаем работу завершённой
+    # Уведомляем владельца, что можно отправлять новый документ
     pending_approvals.pop(approval_id, None)
-
-    # Показываем владельцу кнопку нового документа
     await bot.send_message(
         OWNER_ID,
-        "✅ Работа с документом завершена (получен комментарий).\nМожете отправить следующий.",
+        "✅ Получен комментарий.\nМожете отправить следующий документ.",
         reply_markup=get_new_document_keyboard()
     )
 
