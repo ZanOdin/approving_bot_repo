@@ -18,10 +18,10 @@ pending_approvals = {}
 waiting_for_comment = {}
 owner_pending_files = {}
 owner_message_ids = []
-reviewer_message_ids = {}
-
-# Текущий активный рецензент (сохраняется между сессиями в БД)
 current_reviewer_id = None
+
+# reviewer_id -> {file_index -> message_id} все активные сообщения с файлами у рецензента
+reviewer_active_msgs = {}
 
 
 # ====================== ОЧИСТКА ЧАТОВ ======================
@@ -32,50 +32,6 @@ async def clear_owner_chat():
         except TelegramBadRequest:
             pass
     owner_message_ids.clear()
-
-def track_reviewer_msg(reviewer_id: int, message_id: int):
-    reviewer_message_ids.setdefault(reviewer_id, {})[message_id] = message_id
-
-
-# ====================== КЛАВИАТУРЫ ======================
-def get_owner_reply_keyboard():
-    """Постоянная клавиатура внизу чата для владельца"""
-    return ReplyKeyboardMarkup(
-        keyboard=[
-            [KeyboardButton(text="📄 Отправить файлы"), KeyboardButton(text="👥 Сменить рецензента")]
-        ],
-        resize_keyboard=True,
-        persistent=True
-    )
-
-def get_reviewer_reply_keyboard():
-    """Постоянная клавиатура внизу чата для рецензента"""
-    return ReplyKeyboardMarkup(
-        keyboard=[
-            [KeyboardButton(text="📋 Мои задачи")]
-        ],
-        resize_keyboard=True,
-        persistent=True
-    )
-
-def get_new_document_keyboard():
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="📄 Отправить следующий файл", callback_data="new_document")]
-    ])
-
-def get_reviewer_inline_keyboard(reviewers):
-    keyboard = []
-    for user_id, username, first_name in reviewers:
-        name = f"{first_name or ''} @{username}" if username else f"{first_name or 'Пользователь'} (ID: {user_id})"
-        keyboard.append([InlineKeyboardButton(text=name[:30], callback_data=f"select:{user_id}")])
-    return InlineKeyboardMarkup(inline_keyboard=keyboard)
-
-def get_action_keyboard(approval_id, file_index):
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="✅ Одобрить", callback_data=f"approve:{approval_id}:{file_index}")],
-        [InlineKeyboardButton(text="❌ Отклонить", callback_data=f"reject:{approval_id}:{file_index}")],
-        [InlineKeyboardButton(text="💬 Комментарий", callback_data=f"comment:{approval_id}:{file_index}")]
-    ])
 
 
 # ====================== БАЗА ДАННЫХ ======================
@@ -178,7 +134,7 @@ async def set_setting(key: str, value: str):
         await db.commit()
 
 
-# ====================== ПОЛУЧИТЬ ТЕКУЩЕГО РЕЦЕНЗЕНТА ======================
+# ====================== ТЕКУЩИЙ РЕЦЕНЗЕНТ ======================
 async def get_current_reviewer():
     global current_reviewer_id
     if current_reviewer_id:
@@ -192,6 +148,89 @@ async def set_current_reviewer(reviewer_id: int):
     global current_reviewer_id
     current_reviewer_id = reviewer_id
     await set_setting("current_reviewer_id", str(reviewer_id))
+
+
+# ====================== КЛАВИАТУРЫ ======================
+def get_owner_reply_keyboard():
+    return ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text="📄 Отправить файлы"), KeyboardButton(text="👥 Сменить рецензента")]
+        ],
+        resize_keyboard=True,
+        persistent=True
+    )
+
+def get_reviewer_reply_keyboard():
+    return ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text="📂 Полученные документы")]
+        ],
+        resize_keyboard=True,
+        persistent=True
+    )
+
+def get_reviewer_inline_keyboard(reviewers):
+    keyboard = []
+    for user_id, username, first_name in reviewers:
+        name = f"{first_name or ''} @{username}" if username else f"{first_name or 'Пользователь'} (ID: {user_id})"
+        keyboard.append([InlineKeyboardButton(text=name[:30], callback_data=f"select:{user_id}")])
+    return InlineKeyboardMarkup(inline_keyboard=keyboard)
+
+def get_action_keyboard(approval_id, file_index):
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✅ Одобрить", callback_data=f"approve:{approval_id}:{file_index}")],
+        [InlineKeyboardButton(text="❌ Отклонить", callback_data=f"reject:{approval_id}:{file_index}")],
+        [InlineKeyboardButton(text="💬 Комментарий", callback_data=f"comment:{approval_id}:{file_index}")]
+    ])
+
+
+# ====================== ПЕРЕГЕНЕРАЦИЯ ДОКУМЕНТОВ У РЕЦЕНЗЕНТА ======================
+async def regenerate_reviewer_docs(reviewer_id: int):
+    """Удаляем все активные сообщения с файлами и отправляем заново снизу"""
+
+    # Собираем все активные пакеты для этого рецензента
+    active = {
+        aid: data for aid, data in pending_approvals.items()
+        if data.get("reviewer_id") == reviewer_id
+    }
+
+    if not active:
+        await bot.send_message(reviewer_id, "📭 Активных документов нет.")
+        return
+
+    # Удаляем все старые сообщения с файлами
+    for approval_id, data in active.items():
+        for file_index, msg_id in list(data.get("reviewer_file_msg_ids", {}).items()):
+            try:
+                await bot.delete_message(chat_id=reviewer_id, message_id=msg_id)
+            except TelegramBadRequest:
+                pass
+        data["reviewer_file_msg_ids"] = {}
+
+    # Отправляем все файлы заново снизу
+    total_packs = len(active)
+    for pack_num, (approval_id, data) in enumerate(active.items(), 1):
+        files = data["files"]
+
+        if total_packs > 1:
+            await bot.send_message(
+                reviewer_id,
+                f"📦 Пакет {pack_num} из {total_packs} · {len(files)} файл(ов)"
+            )
+
+        for i, f in enumerate(files):
+            caption_text = None
+            if f.get("file_caption"):
+                caption_text = f"📝 <i>{f['file_caption']}</i>"
+
+            sent = await bot.send_document(
+                chat_id=reviewer_id,
+                document=f["file_id"],
+                caption=caption_text,
+                parse_mode="HTML",
+                reply_markup=get_action_keyboard(approval_id, i)
+            )
+            data["reviewer_file_msg_ids"][i] = sent.message_id
 
 
 # ====================== СТАРТ ======================
@@ -210,7 +249,7 @@ async def cmd_start(message: types.Message):
             reviewers = await get_all_reviewers()
             for uid, uname, fname in reviewers:
                 if uid == reviewer_id:
-                    reviewer_info = f"\n👤 Текущий рецензент: {fname or ''} {'@'+uname if uname else ''}"
+                    reviewer_info = f"\n👤 Текущий рецензент: {fname or ''} {'@'+uname if uname else ''}".strip()
                     break
 
         await message.answer(
@@ -226,71 +265,42 @@ async def cmd_start(message: types.Message):
         )
 
 
-# ====================== КНОПКИ REPLY-КЛАВИАТУРЫ ВЛАДЕЛЬЦА ======================
+# ====================== КНОПКИ ВЛАДЕЛЬЦА ======================
 @dp.message(F.text == "📄 Отправить файлы")
 async def owner_send_files_btn(message: types.Message):
     if message.from_user.id != OWNER_ID:
         return
     reviewer_id = await get_current_reviewer()
     if not reviewer_id:
-        await message.answer(
-            "Сначала выберите рецензента — нажмите «👥 Сменить рецензента»"
-        )
+        await message.answer("Сначала выберите рецензента — нажмите «👥 Сменить рецензента»")
         return
-    await message.answer(
-        "📎 Отправляйте файлы. К каждому можно добавить подпись прямо в Telegram.\n"
-        "Когда загрузите все — нажмите /send"
+    msg = await message.answer(
+        "📎 Отправляйте файлы. К каждому можно добавить подпись.\nКогда закончите — /send"
     )
+    owner_message_ids.append(msg.message_id)
 
 @dp.message(F.text == "👥 Сменить рецензента")
 async def owner_change_reviewer_btn(message: types.Message):
     if message.from_user.id != OWNER_ID:
         return
-    await show_reviewer_list(message)
-
-async def show_reviewer_list(message: types.Message):
     reviewers = await get_all_reviewers()
     reviewers = [r for r in reviewers if r[0] != OWNER_ID]
     if not reviewers:
-        await message.answer(
-            "Пока нет ни одного рецензента. Попросите людей написать боту /start"
-        )
+        await message.answer("Пока нет ни одного рецензента. Попросите людей написать боту /start")
         return
-    msg = await message.answer(
-        "👥 Выберите рецензента:",
-        reply_markup=get_reviewer_inline_keyboard(reviewers)
-    )
+    msg = await message.answer("👥 Выберите рецензента:", reply_markup=get_reviewer_inline_keyboard(reviewers))
     owner_message_ids.append(msg.message_id)
 
 
-# ====================== КНОПКИ REPLY-КЛАВИАТУРЫ РЕЦЕНЗЕНТА ======================
-@dp.message(F.text == "📋 Мои задачи")
-async def reviewer_tasks_btn(message: types.Message):
+# ====================== КНОПКА РЕЦЕНЗЕНТА ======================
+@dp.message(F.text == "📂 Полученные документы")
+async def reviewer_docs_btn(message: types.Message):
     if message.from_user.id == OWNER_ID:
         return
-    # Показываем сколько активных заявок у рецензента
-    count = sum(
-        1 for a in pending_approvals.values()
-        if a.get("reviewer_id") == message.from_user.id
-    )
-    if count:
-        await message.answer(f"📋 У вас {count} активных пакет(ов) на проверку.")
-    else:
-        await message.answer("📭 Активных задач нет.")
+    await regenerate_reviewer_docs(message.from_user.id)
 
 
-# ====================== INLINE: ВЫБОР РЕЦЕНЗЕНТА ======================
-@dp.callback_query(F.data == "new_document")
-async def new_document_callback(callback: types.CallbackQuery):
-    if callback.from_user.id != OWNER_ID:
-        await callback.answer("Только владелец может отправлять документы", show_alert=True)
-        return
-    await callback.answer()
-    owner_pending_files[OWNER_ID] = {"files": [], "reviewer_id": await get_current_reviewer()}
-    await callback.message.answer(
-        "📎 Отправляйте файлы. Когда закончите — /send"
-    )
-
+# ====================== ВЫБОР РЕЦЕНЗЕНТА ======================
 @dp.callback_query(F.data.startswith("select:"))
 async def select_reviewer(callback: types.CallbackQuery):
     if callback.from_user.id != OWNER_ID:
@@ -299,7 +309,6 @@ async def select_reviewer(callback: types.CallbackQuery):
     reviewer_id = int(callback.data.split(":")[1])
     await set_current_reviewer(reviewer_id)
 
-    # Удаляем сообщение со списком рецензентов
     try:
         await callback.message.delete()
     except TelegramBadRequest:
@@ -317,8 +326,8 @@ async def select_reviewer(callback: types.CallbackQuery):
     await callback.answer()
     await callback.message.answer(
         f"✅ Рецензент выбран: {name}\n\n"
-        "📎 Теперь просто отправляйте файлы — они уйдут ему напрямую.\n"
-        "Когда загрузите все файлы одного пакета — нажмите /send",
+        "Просто отправляйте файлы — они уйдут ему напрямую.\n"
+        "Когда загрузите все файлы одного пакета — /send",
         reply_markup=get_owner_reply_keyboard()
     )
 
@@ -330,13 +339,10 @@ async def owner_sent_document(message: types.Message):
 
     reviewer_id = await get_current_reviewer()
     if not reviewer_id:
-        msg = await message.answer(
-            "Сначала выберите рецензента — нажмите «👥 Сменить рецензента»"
-        )
+        msg = await message.answer("Сначала выберите рецензента — нажмите «👥 Сменить рецензента»")
         owner_message_ids.append(msg.message_id)
         return
 
-    # Инициализируем накопление файлов если ещё не начато
     if OWNER_ID not in owner_pending_files:
         owner_pending_files[OWNER_ID] = {"reviewer_id": reviewer_id, "files": []}
 
@@ -378,33 +384,28 @@ async def send_to_reviewer(message: types.Message):
     pending_approvals[approval_id] = {
         "reviewer_id": reviewer_id,
         "files": files,
-        "reviewer_file_msg_ids": {}
+        "reviewer_file_msg_ids": {},
+        "done_files": set()
     }
     await save_review_to_db(approval_id, reviewer_id, files)
 
     try:
         for i, f in enumerate(files):
-            caption_text = ""
+            caption_text = None
             if f.get("file_caption"):
                 caption_text = f"📝 <i>{f['file_caption']}</i>"
 
             sent = await bot.send_document(
                 chat_id=reviewer_id,
                 document=f["file_id"],
-                caption=caption_text if caption_text else None,
+                caption=caption_text,
                 parse_mode="HTML",
                 reply_markup=get_action_keyboard(approval_id, i)
             )
-            # Сохраняем message_id каждого файла у рецензента
             pending_approvals[approval_id]["reviewer_file_msg_ids"][i] = sent.message_id
 
-        # Чистим служебные сообщения у владельца и показываем кнопку
+        # Чистим служебные сообщения владельца — без плашки после
         await clear_owner_chat()
-        msg = await message.answer(
-            f"✅ Отправлено ({len(files)} файл(ов)). Ожидайте ответа.",
-            reply_markup=get_new_document_keyboard()
-        )
-        owner_message_ids.append(msg.message_id)
 
     except Exception as e:
         msg = await message.answer(f"❌ Не удалось отправить: {e}")
@@ -433,7 +434,8 @@ async def process_callback(callback: types.CallbackQuery):
                 {"file_id": f[0], "file_name": f[1], "file_caption": f[2]}
                 for f in files_db
             ],
-            "reviewer_file_msg_ids": {}
+            "reviewer_file_msg_ids": {},
+            "done_files": set() 
         }
 
     approval = pending_approvals[approval_id]
@@ -461,7 +463,7 @@ async def process_callback(callback: types.CallbackQuery):
     reviewer_name = f"@{reviewer.username}" if reviewer.username else str(reviewer.id)
     action_label = "✅ Одобрено" if action == "approve" else "❌ Отклонено"
 
-    # --- Владелец: чистим, отправляем файл с результатом ---
+    # --- Владелец: чистим, отправляем файл с результатом (без плашки после) ---
     await clear_owner_chat()
 
     owner_caption = f"{action_label}\n👤 {reviewer_name}"
@@ -473,13 +475,8 @@ async def process_callback(callback: types.CallbackQuery):
         document=file["file_id"],
         caption=owner_caption
     )
-    await bot.send_message(
-        OWNER_ID,
-        "Отправьте следующий файл или выберите действие.",
-        reply_markup=get_new_document_keyboard()
-    )
 
-    # --- Рецензент: удаляем старое сообщение с файлом по сохранённому message_id ---
+    # --- Рецензент: удаляем старое, отправляем новое с итогом ---
     old_msg_id = approval["reviewer_file_msg_ids"].get(file_index)
     if old_msg_id:
         try:
@@ -491,16 +488,17 @@ async def process_callback(callback: types.CallbackQuery):
     if file.get("file_caption"):
         reviewer_caption += f"\n📝 {file['file_caption']}"
 
-    sent = await bot.send_document(
+    await bot.send_document(
         chat_id=reviewer.id,
         document=file["file_id"],
         caption=reviewer_caption
     )
-    # Обновляем message_id на новое (финальное) сообщение
-    approval["reviewer_file_msg_ids"][file_index] = sent.message_id
 
-    await mark_review_done(approval_id)
-    pending_approvals.pop(approval_id, None)
+    # Помечаем файл обработанным, удаляем пакет только когда все готовы
+    approval["done_files"].add(file_index)
+    if len(approval["done_files"]) >= len(approval["files"]):
+        await mark_review_done(approval_id)
+        pending_approvals.pop(approval_id, None)
 
 
 # ====================== КОММЕНТАРИЙ РЕЦЕНЗЕНТА ======================
@@ -522,7 +520,7 @@ async def handle_comment(message: types.Message):
     file = approval["files"][file_index]
     reviewer_name = f"@{reviewer.username}" if reviewer.username else str(reviewer.id)
 
-    # --- Владелец: чистим, отправляем файл + комментарий ---
+    # --- Владелец: чистим, отправляем файл + комментарий (без плашки после) ---
     await clear_owner_chat()
 
     owner_caption = f"💬 {reviewer_name}:\n\n{message.text}"
@@ -530,17 +528,23 @@ async def handle_comment(message: types.Message):
         owner_caption += f"\n\n📝 {file['file_caption']}"
 
     await bot.send_document(
-        chat_id=OWNER_ID,
+        chat_id=reviewer.id,
         document=file["file_id"],
-        caption=owner_caption
-    )
-    await bot.send_message(
-        OWNER_ID,
-        "Отправьте следующий файл или выберите действие.",
-        reply_markup=get_new_document_keyboard()
+        caption=reviewer_caption
     )
 
-    # --- Рецензент: удаляем старое сообщение с файлом ---
+    try:
+        await bot.delete_message(chat_id=reviewer.id, message_id=message.message_id)
+    except TelegramBadRequest:
+        pass
+
+    # Помечаем файл обработанным, удаляем пакет только когда все готовы
+    approval["done_files"].add(file_index)
+    if len(approval["done_files"]) >= len(approval["files"]):
+        await mark_review_done(approval_id)
+        pending_approvals.pop(approval_id, None)
+
+    # --- Рецензент: удаляем старое, отправляем новое ---
     old_msg_id = approval["reviewer_file_msg_ids"].get(file_index)
     if old_msg_id:
         try:
@@ -558,7 +562,6 @@ async def handle_comment(message: types.Message):
         caption=reviewer_caption
     )
 
-    # Удаляем текстовое сообщение с комментарием рецензента
     try:
         await bot.delete_message(chat_id=reviewer.id, message_id=message.message_id)
     except TelegramBadRequest:
