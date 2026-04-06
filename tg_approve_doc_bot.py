@@ -20,11 +20,8 @@ owner_pending_files = {}
 owner_message_ids = []
 current_reviewer_id = None
 
-# reviewer_id -> {file_index -> message_id} все активные сообщения с файлами у рецензента
-reviewer_active_msgs = {}
 
-
-# ====================== ОЧИСТКА ЧАТОВ ======================
+# ====================== ОЧИСТКА ЧАТА ВЛАДЕЛЬЦА ======================
 async def clear_owner_chat():
     for msg_id in owner_message_ids.copy():
         try:
@@ -186,9 +183,6 @@ def get_action_keyboard(approval_id, file_index):
 
 # ====================== ПЕРЕГЕНЕРАЦИЯ ДОКУМЕНТОВ У РЕЦЕНЗЕНТА ======================
 async def regenerate_reviewer_docs(reviewer_id: int):
-    """Удаляем все активные сообщения с файлами и отправляем заново снизу"""
-
-    # Собираем все активные пакеты для этого рецензента
     active = {
         aid: data for aid, data in pending_approvals.items()
         if data.get("reviewer_id") == reviewer_id
@@ -198,7 +192,6 @@ async def regenerate_reviewer_docs(reviewer_id: int):
         await bot.send_message(reviewer_id, "📭 Активных документов нет.")
         return
 
-    # Удаляем все старые сообщения с файлами
     for approval_id, data in active.items():
         for file_index, msg_id in list(data.get("reviewer_file_msg_ids", {}).items()):
             try:
@@ -207,10 +200,10 @@ async def regenerate_reviewer_docs(reviewer_id: int):
                 pass
         data["reviewer_file_msg_ids"] = {}
 
-    # Отправляем все файлы заново снизу
     total_packs = len(active)
     for pack_num, (approval_id, data) in enumerate(active.items(), 1):
         files = data["files"]
+        done_files = data.get("done_files", set())
 
         if total_packs > 1:
             await bot.send_message(
@@ -219,6 +212,9 @@ async def regenerate_reviewer_docs(reviewer_id: int):
             )
 
         for i, f in enumerate(files):
+            if i in done_files:
+                continue  # Уже обработанные не показываем
+
             caption_text = None
             if f.get("file_caption"):
                 caption_text = f"📝 <i>{f['file_caption']}</i>"
@@ -404,7 +400,6 @@ async def send_to_reviewer(message: types.Message):
             )
             pending_approvals[approval_id]["reviewer_file_msg_ids"][i] = sent.message_id
 
-        # Чистим служебные сообщения владельца — без плашки после
         await clear_owner_chat()
 
     except Exception as e:
@@ -435,7 +430,7 @@ async def process_callback(callback: types.CallbackQuery):
                 for f in files_db
             ],
             "reviewer_file_msg_ids": {},
-            "done_files": set() 
+            "done_files": set()
         }
 
     approval = pending_approvals[approval_id]
@@ -448,22 +443,29 @@ async def process_callback(callback: types.CallbackQuery):
     await callback.answer()
 
     if action == "comment":
+        # Запоминаем ожидание комментария
         waiting_for_comment[reviewer.id] = {
             "approval_id": approval_id,
             "file_index": file_index
         }
-        await callback.message.answer("💬 Напишите ваш комментарий к этому файлу:")
+        # Убираем только кнопки — сообщение с файлом НЕ трогаем
         try:
             await callback.message.edit_reply_markup(reply_markup=None)
-        except:
+        except TelegramBadRequest:
             pass
+        await bot.send_message(reviewer.id, "💬 Напишите ваш комментарий к этому файлу:")
         return
 
+    await _finalize_file(approval_id, approval, file_index, action, reviewer)
+
+
+async def _finalize_file(approval_id, approval, file_index, action, reviewer):
+    """Финализируем ответ по конкретному файлу"""
     file = approval["files"][file_index]
     reviewer_name = f"@{reviewer.username}" if reviewer.username else str(reviewer.id)
     action_label = "✅ Одобрено" if action == "approve" else "❌ Отклонено"
 
-    # --- Владелец: чистим, отправляем файл с результатом (без плашки после) ---
+    # --- Владелец ---
     await clear_owner_chat()
 
     owner_caption = f"{action_label}\n👤 {reviewer_name}"
@@ -476,7 +478,7 @@ async def process_callback(callback: types.CallbackQuery):
         caption=owner_caption
     )
 
-    # --- Рецензент: удаляем старое, отправляем новое с итогом ---
+    # --- Рецензент: удаляем старое сообщение с файлом, шлём новое ---
     old_msg_id = approval["reviewer_file_msg_ids"].get(file_index)
     if old_msg_id:
         try:
@@ -494,7 +496,7 @@ async def process_callback(callback: types.CallbackQuery):
         caption=reviewer_caption
     )
 
-    # Помечаем файл обработанным, удаляем пакет только когда все готовы
+    # Помечаем файл готовым
     approval["done_files"].add(file_index)
     if len(approval["done_files"]) >= len(approval["files"]):
         await mark_review_done(approval_id)
@@ -502,12 +504,23 @@ async def process_callback(callback: types.CallbackQuery):
 
 
 # ====================== КОММЕНТАРИЙ РЕЦЕНЗЕНТА ======================
-@dp.message(F.text, lambda m: m.from_user.id in waiting_for_comment)
-async def handle_comment(message: types.Message):
+# Этот хендлер должен быть ВЫШЕ общих текстовых хендлеров
+@dp.message(F.text & ~F.text.startswith("/"))
+async def handle_any_text(message: types.Message):
     reviewer = message.from_user
-    data = waiting_for_comment.pop(reviewer.id, None)
-    if not data:
+
+    # Сначала проверяем — ждём ли комментарий от этого пользователя
+    if reviewer.id in waiting_for_comment:
+        await _handle_comment(message)
         return
+
+    # Иначе — кнопки reply-клавиатуры обработаются своими хендлерами выше,
+    # остальное игнорируем
+
+
+async def _handle_comment(message: types.Message):
+    reviewer = message.from_user
+    data = waiting_for_comment.pop(reviewer.id)
 
     approval_id = data["approval_id"]
     file_index = data["file_index"]
@@ -520,7 +533,7 @@ async def handle_comment(message: types.Message):
     file = approval["files"][file_index]
     reviewer_name = f"@{reviewer.username}" if reviewer.username else str(reviewer.id)
 
-    # --- Владелец: чистим, отправляем файл + комментарий (без плашки после) ---
+    # --- Владелец ---
     await clear_owner_chat()
 
     owner_caption = f"💬 {reviewer_name}:\n\n{message.text}"
@@ -528,23 +541,12 @@ async def handle_comment(message: types.Message):
         owner_caption += f"\n\n📝 {file['file_caption']}"
 
     await bot.send_document(
-        chat_id=reviewer.id,
+        chat_id=OWNER_ID,
         document=file["file_id"],
-        caption=reviewer_caption
+        caption=owner_caption
     )
 
-    try:
-        await bot.delete_message(chat_id=reviewer.id, message_id=message.message_id)
-    except TelegramBadRequest:
-        pass
-
-    # Помечаем файл обработанным, удаляем пакет только когда все готовы
-    approval["done_files"].add(file_index)
-    if len(approval["done_files"]) >= len(approval["files"]):
-        await mark_review_done(approval_id)
-        pending_approvals.pop(approval_id, None)
-
-    # --- Рецензент: удаляем старое, отправляем новое ---
+    # --- Рецензент: удаляем сообщение с файлом (кнопки уже убраны), шлём новое ---
     old_msg_id = approval["reviewer_file_msg_ids"].get(file_index)
     if old_msg_id:
         try:
@@ -562,13 +564,17 @@ async def handle_comment(message: types.Message):
         caption=reviewer_caption
     )
 
+    # Удаляем текстовое сообщение комментария
     try:
         await bot.delete_message(chat_id=reviewer.id, message_id=message.message_id)
     except TelegramBadRequest:
         pass
 
-    await mark_review_done(approval_id)
-    pending_approvals.pop(approval_id, None)
+    # Помечаем файл готовым
+    approval["done_files"].add(file_index)
+    if len(approval["done_files"]) >= len(approval["files"]):
+        await mark_review_done(approval_id)
+        pending_approvals.pop(approval_id, None)
 
 
 # ====================== ЗАПУСК ======================
